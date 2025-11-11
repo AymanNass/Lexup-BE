@@ -1,0 +1,317 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Vertex Mini Legal</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;margin:24px;line-height:1.4}
+    .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+    input,select,button{font-size:16px;padding:10px;border:1px solid #ccc;border-radius:10px}
+    input{flex:1;min-width:260px}
+    button{cursor:pointer}
+    .card{border:1px solid #eee;border-radius:16px;padding:16px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,.05)}
+    .title{font-weight:600;margin-bottom:6px}
+    .meta{opacity:.7;font-size:12px;margin-bottom:8px}
+    .text{white-space:pre-wrap}
+    .tabs{display:flex;margin-bottom:20px;border-bottom:1px solid #eee;padding-bottom:10px}
+    .tab{padding:8px 16px;cursor:pointer;margin-right:5px;border-radius:10px}
+    .tab.active{background:#eef;font-weight:bold}
+    .tab-content{display:none}
+    .tab-content.active{display:block}
+    .sources-section{margin-top:20px;padding-top:10px;border-top:1px solid #eee}
+    .source-link{color:blue;text-decoration:none;display:block;margin:5px 0}
+  </style>
+</head>
+<body>
+  <h1>Vertex Mini Legal</h1>
+  
+  <div class="tabs">
+    <div class="tab active" data-tab="search">Ricerca</div>
+    <div class="tab" data-tab="chat">Chat</div>
+    <div class="tab" data-tab="debug">Debug</div>
+  </div>
+  
+  <div id="search-tab" class="tab-content active">
+    <div class="row">
+      <input id="q" placeholder="Cerca..." value="GDPR fornitore AI"/>
+      <select id="mode">
+        <option value="DOCUMENTS">DOCUMENTS</option>
+        <option value="CHUNKS" selected>CHUNKS</option>
+      </select>
+      <select id="size">
+        <option selected>3</option>
+        <option>5</option>
+        <option>8</option>
+        <option>12</option>
+      </select>
+      <button id="go">Cerca</button>
+    </div>
+    <div id="out"></div>
+  </div>
+  
+  <div id="chat-tab" class="tab-content">
+    <div class="row">
+      <input id="chat-input" placeholder="Fai una domanda..." value="Quali sono gli obblighi per un fornitore di AI secondo il GDPR?"/>
+      <button id="chat-go">Chiedi</button>
+    </div>
+    <div id="chat-out">
+      <p>Benvenuto nell'assistente legale. Come posso aiutarti?</p>
+    </div>
+  </div>
+  
+  <div id="debug-tab" class="tab-content">
+    <h3>Debug Gemini</h3>
+    <div class="row">
+      <textarea id="debug-prompt" style="width:100%;min-height:100px;padding:10px;border-radius:10px;margin-bottom:10px" 
+        placeholder="Inserisci un prompt per testare direttamente Gemini">Ciao, sono un utente. Chi sei tu?</textarea>
+    </div>
+    <div class="row">
+      <button id="debug-gemini-btn">Test Gemini</button>
+    </div>
+    <div id="debug-out" style="margin-top:20px;white-space:pre-wrap;"></div>
+  </div>
+  
+  <script>
+    // Tabs management
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById(tab.dataset.tab + '-tab').classList.add('active');
+      });
+    });
+    
+    // Search functionality
+    const q = document.getElementById("q");
+    const mode = document.getElementById("mode");
+    const size = document.getElementById("size");
+    const out = document.getElementById("out");
+    const go = document.getElementById("go");
+    
+    async function runSearch() {
+      out.innerHTML = "Caricamento...";
+      const u = new URL(window.location.origin + "/search");
+      u.searchParams.set("q", q.value || "");
+      u.searchParams.set("mode", mode.value);
+      u.searchParams.set("page_size", size.value);
+      
+      try {
+        const r = await fetch(u.toString());
+        if (!r.ok) {
+          out.innerHTML = "Errore: " + r.status;
+          return;
+        }
+        
+        const j = await r.json();
+        if (!j.ok || !j.results || !j.results.length) {
+          out.innerHTML = "Nessun risultato";
+          return;
+        }
+        
+        // Prepara il contenuto
+        let html = '';
+        j.results.forEach(x => {
+          let text = x.text || "";
+          text = text.replace(/</g, "&lt;");
+          
+          html += `
+          <div class="card">
+            <div class="title">${x.title || ""}</div>
+            <div class="meta">
+              score: ${x.score ? x.score.toFixed(4) : "N/A"}
+              ${x.link ? `· <a href="${x.link}" target="_blank" rel="noopener">apri fonte</a>` : ""}
+              ${x.id ? `· id: ${x.id}` : ""}
+            </div>
+            <div class="text">${text}</div>
+          </div>
+          `;
+        });
+        
+        out.innerHTML = html;
+      } catch (error) {
+        out.innerHTML = "Errore: " + error.message;
+      }
+    }
+    
+    go.addEventListener("click", runSearch);
+    q.addEventListener("keydown", e => {
+      if (e.key === "Enter") runSearch();
+    });
+    
+    // Chat functionality
+    const chatInput = document.getElementById("chat-input");
+    const chatGo = document.getElementById("chat-go");
+    const chatOut = document.getElementById("chat-out");
+    
+    async function runChat() {
+      const question = chatInput.value;
+      if (!question.trim()) return;
+      
+      // Aggiungi la domanda dell'utente
+      let userDiv = document.createElement("div");
+      userDiv.className = "card";
+      userDiv.style.backgroundColor = "#f5f5ff";
+      
+      let userTitle = document.createElement("div");
+      userTitle.className = "title";
+      userTitle.textContent = "Tu";
+      
+      let userText = document.createElement("div");
+      userText.className = "text";
+      userText.textContent = question;
+      
+      userDiv.appendChild(userTitle);
+      userDiv.appendChild(userText);
+      chatOut.appendChild(userDiv);
+      
+      // Aggiungi messaggio di caricamento
+      let loadingDiv = document.createElement("div");
+      loadingDiv.className = "card";
+      loadingDiv.id = "loading-" + Date.now();
+      
+      let loadingTitle = document.createElement("div");
+      loadingTitle.className = "title";
+      loadingTitle.textContent = "Assistente";
+      
+      let loadingText = document.createElement("div");
+      loadingText.className = "text";
+      loadingText.textContent = "Sto elaborando la risposta...";
+      
+      loadingDiv.appendChild(loadingTitle);
+      loadingDiv.appendChild(loadingText);
+      chatOut.appendChild(loadingDiv);
+      
+      // Scroll in fondo
+      chatOut.scrollTop = chatOut.scrollHeight;
+      
+      try {
+        const response = await fetch("/chat", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            question: question,
+            include_sources: true
+          })
+        });
+        
+        if (!response.ok) {
+          throw new Error(`Errore ${response.status}: ${await response.text()}`);
+        }
+        
+        const data = await response.json();
+        
+        // Crea elemento di risposta
+        let assistantDiv = document.createElement("div");
+        assistantDiv.className = "card";
+        
+        let assistantTitle = document.createElement("div");
+        assistantTitle.className = "title";
+        assistantTitle.textContent = "Assistente";
+        
+        let assistantText = document.createElement("div");
+        assistantText.className = "text";
+        assistantText.innerHTML = data.answer.replace(/</g, "&lt;").replace(/\n/g, "<br>");
+        
+        assistantDiv.appendChild(assistantTitle);
+        assistantDiv.appendChild(assistantText);
+        
+        // Aggiungi fonti se presenti
+        if (data.sources && data.sources.length > 0) {
+          let sourcesDiv = document.createElement("div");
+          sourcesDiv.className = "sources-section";
+          
+          let sourcesTitle = document.createElement("div");
+          sourcesTitle.className = "title";
+          sourcesTitle.textContent = "Fonti:";
+          sourcesDiv.appendChild(sourcesTitle);
+          
+          data.sources.forEach(source => {
+            let sourceLink = document.createElement("a");
+            sourceLink.className = "source-link";
+            sourceLink.href = source.link;
+            sourceLink.target = "_blank";
+            sourceLink.textContent = source.title || source.link;
+            sourcesDiv.appendChild(sourceLink);
+          });
+          
+          assistantDiv.appendChild(sourcesDiv);
+        }
+        
+        // Sostituisci il messaggio di caricamento
+        loadingDiv.replaceWith(assistantDiv);
+        
+        // Pulisci input
+        chatInput.value = "";
+        
+      } catch (error) {
+        let errorDiv = document.createElement("div");
+        errorDiv.className = "card";
+        errorDiv.style.backgroundColor = "#fff5f5";
+        
+        let errorTitle = document.createElement("div");
+        errorTitle.className = "title";
+        errorTitle.textContent = "Errore";
+        
+        let errorText = document.createElement("div");
+        errorText.className = "text";
+        errorText.textContent = error.message;
+        
+        errorDiv.appendChild(errorTitle);
+        errorDiv.appendChild(errorText);
+        
+        loadingDiv.replaceWith(errorDiv);
+      }
+      
+      // Scroll in fondo
+      chatOut.scrollTop = chatOut.scrollHeight;
+    }
+    
+    chatGo.addEventListener("click", runChat);
+    chatInput.addEventListener("keydown", e => {
+      if (e.key === "Enter") runChat();
+    });
+    
+    // Debug Gemini functionality
+    const debugPrompt = document.getElementById("debug-prompt");
+    const debugGeminiBtn = document.getElementById("debug-gemini-btn");
+    const debugOut = document.getElementById("debug-out");
+    
+    async function testGemini() {
+      const prompt = debugPrompt.value;
+      if (!prompt.trim()) return;
+      
+      debugOut.textContent = "Caricamento...";
+      
+      try {
+        const response = await fetch("/debug/gemini", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            prompt: prompt
+          })
+        });
+        
+        const data = await response.json();
+        
+        if (data.ok) {
+          debugOut.textContent = "Risposta Gemini:\n\n" + data.response;
+        } else {
+          debugOut.textContent = "Errore:\n\n" + data.error + 
+            "\n\nModello: " + data.model + 
+            "\nRegione: " + data.location +
+            "\nProgetto: " + data.project;
+        }
+      } catch (error) {
+        debugOut.textContent = "Errore di connessione: " + error.message;
+      }
+    }
+    
+    debugGeminiBtn.addEventListener("click", testGemini);
+    
+    // Esegui la ricerca iniziale
+    // runSearch();
+  </script>
+</body>
+</html>
