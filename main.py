@@ -109,7 +109,6 @@ class ChatResponse(BaseModel):
     answer: str
     sources: List[Source] = Field(default_factory=list)
     debug: Optional[Dict[str, Any]] = None
-    sources: List[Source] = Field(default_factory=list)
 
 # ========= App =========
 app = FastAPI(title="vertex-mini", version="1.0.0")
@@ -397,10 +396,16 @@ def _prepare_context(search_results: List[Dict[str, Any]]) -> tuple:
     filtered_results = [
         r for r in search_results 
         if r.get("score", 0) >= RAG_MIN_SCORE
-    ][:RAG_MAX_CHUNKS]
+    ]
+    
+    # Ordina i risultati per punteggio decrescente
+    filtered_results.sort(key=lambda r: r.get("score", 0), reverse=True)
+    
+    # Limita il numero di chunk
+    filtered_results = filtered_results[:RAG_MAX_CHUNKS]
     
     print(f"4. Filtro applicato: score >= {RAG_MIN_SCORE}, max chunks = {RAG_MAX_CHUNKS}")
-    print(f"5. Risultati dopo filtro: {len(filtered_results)}/{len(search_results)}")
+    print(f"5. Risultati dopo filtro e ordinamento: {len(filtered_results)}/{len(search_results)}")
     
     # Estrai e pulisci i testi
     chunks = []
@@ -412,6 +417,11 @@ def _prepare_context(search_results: List[Dict[str, Any]]) -> tuple:
         text = result.get("text", "")
         clean_text = _clean_html(text)
         
+        # Rimuovi testo troppo breve
+        if clean_text and len(clean_text) < 20:  # ignora frammenti troppo piccoli
+            print(f"\n   Chunk {i+1}/{len(filtered_results)}: IGNORATO (troppo breve: {len(clean_text)} caratteri)")
+            continue
+            
         print(f"\n   Chunk {i+1}/{len(filtered_results)}:")
         print(f"   • Score: {result.get('score', 0):.4f}")
         print(f"   • Titolo: {result.get('title', 'N/A')}")
@@ -424,6 +434,14 @@ def _prepare_context(search_results: List[Dict[str, Any]]) -> tuple:
         if clean_text:
             preview = clean_text[:100].replace('\n', ' ') + ("..." if len(clean_text) > 100 else "")
             print(f"   • Preview: {preview}")
+            
+            # Aggiungi un header al chunk per identificare la fonte
+            title = result.get("title", "").strip()
+            if title:
+                # Crea un header formattato per ogni chunk
+                header = f"DOCUMENTO: {title}"
+                clean_text = f"{header}\n\n{clean_text}"
+            
             chunks.append(clean_text)
             
             # Aggiungi la fonte
@@ -435,13 +453,14 @@ def _prepare_context(search_results: List[Dict[str, Any]]) -> tuple:
         else:
             print(f"   • ATTENZIONE: Testo vuoto dopo la pulizia - chunk ignorato")
     
-    # Concatena i chunk con un separatore
-    context = RAG_CHUNK_SEPARATOR.join(chunks)
+    # Concatena i chunk con un separatore più visibile
+    separator = "\n\n" + "=" * 40 + "\n\n"
+    context = separator.join(chunks)
     
     print(f"\n7. Riepilogo finale:")
     print(f"   • Chunks utilizzati: {len(chunks)}/{len(filtered_results)}")
     print(f"   • Lunghezza contesto finale: {len(context)} caratteri")
-    print(f"   • Separatore chunk: '{RAG_CHUNK_SEPARATOR}'")
+    print(f"   • Separatore chunk: '{separator}'")
     print(f"   • Fonti incluse: {len(sources)}")
     
     if context:
@@ -469,12 +488,20 @@ def _build_prompt(question: str, context: str, history: Optional[List[Dict[str, 
     Returns:
         str: Il prompt completo
     """
-    # Sistema le istruzioni per il modello
-    system_prompt = """Sei un assistente legale esperto che risponde a domande utilizzando solo le informazioni fornite nel CONTESTO.
-Se l'informazione non è presente nel CONTESTO, rispondi "Non ho informazioni sufficienti per rispondere a questa domanda."
-Non inventare o inferire informazioni che non sono esplicitamente indicate nel CONTESTO.
-Struttura la tua risposta in modo chiaro e professionale, citando quando possibile la fonte specifica dell'informazione.
-Rispondi in italiano."""
+    # Sistema le istruzioni per il modello - versione migliorata
+    system_prompt = """Sei un esperto consulente legale specializzato nella normativa europea e italiana. 
+Il tuo compito è rispondere in modo naturale, chiaro e professionale alle domande dell'utente.
+
+Per aiutarti, ti fornirò dei documenti che contengono informazioni pertinenti. Utilizzali come fonte per le tue risposte ma IMPORTANTE:
+- NON menzionare mai frasi come "secondo il contesto", "in base alle informazioni fornite" o simili
+- NON dire mai "CONTESTO" o fare riferimento diretto ai documenti forniti
+- Rispondi in modo conversazionale ed esauriente, come un esperto legale che conosce la materia
+- Integra le informazioni dai documenti in modo naturale nella tua risposta
+- Se non hai abbastanza informazioni per una risposta completa, spiega cosa sai e cosa richiederebbe ulteriori approfondimenti
+- Quando citi leggi o regolamenti, sii preciso e specifico senza sembrare che stai leggendo direttamente da un documento
+- Non inventare informazioni: se una risposta richiede dati non disponibili, sii onesto riguardo ai limiti della tua conoscenza attuale
+
+Rispondi sempre in italiano con un tono professionale ma accessibile, come un consulente che vuole essere chiaro e utile."""
     
     print(f"\n=== COSTRUZIONE PROMPT ===")
     print(f"1. System Prompt: {len(system_prompt)} caratteri")
@@ -482,19 +509,32 @@ Rispondi in italiano."""
     print(f"3. Domanda: '{question}'")
     
     # Gestione della cronologia delle conversazioni, se presente
-    history_text = ""
+    conversation_context = ""
     if history and isinstance(history, list) and len(history) > 0:
         print(f"4. Storia della conversazione: {len(history)} messaggi")
-        # La storia viene ignorata nell'implementazione attuale, ma possiamo loggare
+        # Costruzione del contesto conversazionale
+        conversation_context = "Questa è la conversazione precedente tra te e l'utente:\n\n"
         for i, msg in enumerate(history):
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
+            if role == "user":
+                conversation_context += f"Utente: {content}\n\n"
+            elif role == "assistant":
+                conversation_context += f"Tu: {content}\n\n"
             print(f"   Messaggio {i+1}: {role} - {len(content)} caratteri")
+        conversation_context += "Continua la conversazione rispondendo alla nuova domanda dell'utente.\n\n"
     else:
         print("4. Nessuna storia di conversazione")
     
-    # Aggiungi il contesto e la domanda al prompt
-    prompt = f"{system_prompt}\n\nCONTESTO:\n{context}\n\nDOMANDA: {question}\n\nRISPOSTA:"
+    # Aggiungi il contesto, la storia e la domanda al prompt in modo più naturale
+    prompt = f"{system_prompt}\n\n"
+    
+    if conversation_context:
+        prompt += f"{conversation_context}\n"
+    
+    prompt += f"DOCUMENTI DI RIFERIMENTO:\n{context}\n\n"
+    prompt += f"DOMANDA DELL'UTENTE: {question}\n\n"
+    prompt += "Fornisci una risposta professionale, conversazionale ed esauriente:"
     
     print(f"5. Prompt finale: {len(prompt)} caratteri totali")
     # Stampa una preview del prompt completo
@@ -563,13 +603,17 @@ def _generate_response(prompt: str, max_tokens: Optional[int] = None, temperatur
         # Estrai il testo della risposta
         answer = response.text
         
-        # Log della risposta
+        # Post-processing della risposta per migliorare la naturalezza
+        print(f"\n5. Esecuzione post-processing della risposta...")
+        answer = _post_process_response(answer)
+        
+        # Log della risposta processata
         answer_preview = answer[:300] + ("..." if len(answer) > 300 else "")
-        print(f"\n5. Risposta generata ({len(answer)} caratteri):")
+        print(f"\n6. Risposta finale dopo post-processing ({len(answer)} caratteri):")
         print(f"   {answer_preview}")
         
         total_time = time.time() - start_time
-        print(f"\n6. Tempo totale di elaborazione: {total_time:.2f} secondi")
+        print(f"\n7. Tempo totale di elaborazione: {total_time:.2f} secondi")
         print("=== FINE GENERAZIONE RISPOSTA ===\n")
         
         return answer
@@ -583,6 +627,70 @@ def _generate_response(prompt: str, max_tokens: Optional[int] = None, temperatur
         print("=== FINE GENERAZIONE RISPOSTA (CON ERRORE) ===\n")
         
         return "Mi dispiace, ho riscontrato un problema nel generare una risposta. Riprova più tardi."
+
+def _post_process_response(text: str) -> str:
+    """
+    Esegue il post-processing della risposta per renderla più naturale.
+    
+    Args:
+        text: Il testo della risposta generata
+        
+    Returns:
+        str: Il testo processato
+    """
+    if not text:
+        return text
+        
+    # Lista di espressioni da sostituire per rendere la risposta più naturale
+    replacements = [
+        # Rimuovi riferimenti diretti al contesto
+        (r"(?i)Nel CONTESTO fornito,?", ""),
+        (r"(?i)Secondo il CONTESTO,?", ""),
+        (r"(?i)In base al CONTESTO,?", ""),
+        (r"(?i)Il CONTESTO indica che", ""),
+        (r"(?i)Come indicato nel CONTESTO,?", ""),
+        (r"(?i)Dal CONTESTO emerge che", ""),
+        (r"(?i)Il CONTESTO specifica che", ""),
+        (r"(?i)Come specificato nel CONTESTO,?", ""),
+        (r"(?i)Come riportato nel CONTESTO,?", ""),
+        (r"(?i)In base alle informazioni fornite nel CONTESTO,?", ""),
+        (r"(?i)Dalle informazioni presenti nel CONTESTO,?", ""),
+        
+        # Rimuovi riferimenti indiretti
+        (r"(?i)In base alle informazioni fornite,?", ""),
+        (r"(?i)Secondo le informazioni disponibili,?", ""),
+        (r"(?i)Dalle informazioni disponibili,?", ""),
+        
+        # Sostituisci le frasi sulla mancanza di informazioni
+        (r"(?i)Non ho informazioni sufficienti nel CONTESTO per rispondere a questa domanda", 
+          "Non ho informazioni sufficienti per rispondere completamente a questa domanda"),
+        (r"(?i)Il CONTESTO non fornisce informazioni su", 
+          "Non ho informazioni specifiche su"),
+          
+        # Rimuovi le "Fonti:" alla fine della risposta (verranno gestite separatamente)
+        (r"(?i)Fonti:.*$", ""),
+    ]
+    
+    # Applica tutte le sostituzioni
+    processed_text = text
+    for pattern, replacement in replacements:
+        processed_text = re.sub(pattern, replacement, processed_text)
+    
+    # Rimuovi righe vuote multiple
+    processed_text = re.sub(r'\n\s*\n\s*\n+', '\n\n', processed_text)
+    
+    # Rimuovi spazi multipli
+    processed_text = re.sub(r' +', ' ', processed_text)
+    
+    # Rimuovi spazi all'inizio e alla fine
+    processed_text = processed_text.strip()
+    
+    # Aggiungi una capitalizzazione della prima lettera se necessario
+    if processed_text and processed_text[0].islower():
+        processed_text = processed_text[0].upper() + processed_text[1:]
+    
+    print(f"Post-processing completato: {len(text)} -> {len(processed_text)} caratteri")
+    return processed_text
 def _get_document_text(doc_id: str) -> Dict[str, Any]:
     """Legge il documento direttamente dal Data Store (richiede Serve content attivo)."""
     if not DATA_STORE_ID:
@@ -954,8 +1062,24 @@ async def chat_endpoint(body: ChatIn):
             print(f"• Risultato: FALLITO - Nessun contesto pertinente trovato")
             print("==================================================\n")
             
+            # Genera una risposta più naturale basata sulla domanda
+            # Cerca parole chiave nella domanda per personalizzare la risposta
+            question_lower = body.question.lower()
+            
+            if any(term in question_lower for term in ["gdpr", "rgpd", "protezione dati", "data protection"]):
+                no_info_response = "Non ho trovato informazioni specifiche sulla tua domanda relativa al GDPR. Per questioni di protezione dei dati personali, ti consiglio di consultare il testo completo del Regolamento UE 2016/679 o rivolgerti all'autorità garante nazionale. Posso aiutarti con un altro aspetto specifico della normativa?"
+            
+            elif any(term in question_lower for term in ["ai act", "intelligenza artificiale", "regolamento ia", "ai regulation"]):
+                no_info_response = "Non ho trovato informazioni sufficientemente specifiche sulla tua domanda relativa al Regolamento UE sull'Intelligenza Artificiale. La normativa è recente e in evoluzione. Posso aiutarti su altri aspetti più specifici o su altre questioni legali?"
+                
+            elif any(term in question_lower for term in ["obbligo", "obblighi", "requisito", "requisiti", "compliance"]):
+                no_info_response = "Non ho trovato informazioni specifiche sugli obblighi legali richiesti nella tua domanda. La normativa in questo ambito potrebbe richiedere un'analisi più dettagliata. Potrei aiutarti meglio se specifichi il contesto normativo di riferimento o il settore particolare che ti interessa."
+                
+            else:
+                no_info_response = "Mi dispiace, ma non ho trovato informazioni specifiche per rispondere alla tua domanda. Potrei aiutarti meglio se la riformulassi in modo più specifico o se indicassi a quale normativa o regolamento sei interessato."
+            
             return ChatResponse(
-                answer="Non ho trovato informazioni pertinenti per rispondere alla tua domanda.",
+                answer=no_info_response,
                 sources=[]
             )
         
@@ -991,8 +1115,21 @@ async def chat_endpoint(body: ChatIn):
             "answer_length": len(answer)
         })
         
-        # 5. Preparazione della risposta
-        source_objects = [Source(**source) for source in sources] if body.include_sources else []
+        # 5. Filtra e prepara le fonti per l'inclusione nella risposta
+        # Ordina le fonti per score e rimuovi duplicati
+        if body.include_sources and sources:
+            print(f"\n=== PREPARAZIONE FONTI ===")
+            processed_sources = _process_sources(sources)
+            print(f"Fonti originali: {len(sources)}, Fonti processate: {len(processed_sources)}")
+            source_objects = [Source(**source) for source in processed_sources]
+        else:
+            source_objects = []
+        
+        # Aggiungi al log
+        rag_debug["steps"].append({
+            "step": "sources_processing",
+            "sources_count": len(source_objects)
+        })
         
         # Completa il log
         rag_debug["timestamps"]["end"] = time.time()
@@ -1002,7 +1139,7 @@ async def chat_endpoint(body: ChatIn):
         print(f"\n=== RIEPILOGO FINALE ===")
         print(f"• Totale passaggi: {len(rag_debug['steps'])}")
         print(f"• Tempo totale: {rag_debug['total_time']:.2f} secondi")
-        print(f"• Fonti utilizzate: {len(sources)}")
+        print(f"• Fonti utilizzate: {len(source_objects)}")
         print(f"• Lunghezza risposta: {len(answer)} caratteri")
         print(f"• Risultato: SUCCESSO - Risposta generata")
         print("==================================================\n")
@@ -1032,6 +1169,60 @@ async def chat_endpoint(body: ChatIn):
         print(traceback.format_exc())
         print("==================================================\n")
         raise HTTPException(status_code=502, detail=f"Errore durante l'elaborazione: {str(e)}")
+
+def _process_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Processa le fonti per rimuovere duplicati e ordinarle per rilevanza.
+    
+    Args:
+        sources: Lista delle fonti con title, link e score
+    
+    Returns:
+        List[Dict[str, Any]]: Lista filtrata e ordinata delle fonti
+    """
+    if not sources:
+        return []
+    
+    # Dizionario per tenere traccia delle fonti uniche (per link)
+    unique_sources = {}
+    
+    # Aggrega le fonti con lo stesso link e tieni il punteggio più alto
+    for source in sources:
+        link = source.get("link", "")
+        title = source.get("title", "")
+        score = source.get("score", 0.0)
+        
+        # Salta fonti senza link
+        if not link:
+            continue
+        
+        # Se il link è già presente, aggiorna solo se il punteggio è più alto
+        if link in unique_sources:
+            if score > unique_sources[link]["score"]:
+                unique_sources[link] = {
+                    "title": title or unique_sources[link]["title"],
+                    "link": link,
+                    "score": score
+                }
+        else:
+            unique_sources[link] = {
+                "title": title or link,
+                "link": link, 
+                "score": score
+            }
+    
+    # Converti il dizionario in lista
+    result = list(unique_sources.values())
+    
+    # Ordina per score decrescente
+    result.sort(key=lambda x: x.get("score", 0), reverse=True)
+    
+    # Limita il numero di fonti (opzionale)
+    max_sources = 5
+    if len(result) > max_sources:
+        result = result[:max_sources]
+    
+    return result
 
 @app.get("/", response_class=FileResponse)
 def index():
