@@ -6,3 +6,5 @@ pydantic
 google-cloud-aiplatform
 html2text
 typing-extensions
+scikit-learn
+numpy

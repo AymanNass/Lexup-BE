@@ -6,7 +6,9 @@ import json
 import hashlib
 import threading
 import html2text
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+import heapq
+from functools import lru_cache
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse
@@ -21,10 +23,13 @@ from google.protobuf.json_format import MessageToDict
 import google.cloud.aiplatform as aiplatform
 from google.cloud.aiplatform_v1.services.prediction_service import PredictionServiceClient
 from google.cloud.aiplatform_v1.types.prediction_service import PredictRequest
-from vertexai.generative_models import GenerativeModel # Aggiungi questa linea
+from vertexai.generative_models import GenerativeModel, Part
+from vertexai.language_models import TextEmbeddingModel
 import google.auth
 from google.auth.transport.requests import AuthorizedSession
 import uvicorn
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ========= Env =========
 PROJECT_ID = os.getenv("PROJECT_ID")
@@ -48,6 +53,17 @@ GEMINI_TOP_K = int(os.getenv("GEMINI_TOP_K", "40"))
 RAG_MAX_CHUNKS = int(os.getenv("RAG_MAX_CHUNKS", "5"))
 RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0"))  # Soglia minima di pertinenza
 RAG_CHUNK_SEPARATOR = os.getenv("RAG_CHUNK_SEPARATOR", "\n---\n")
+
+# ========= Advanced Retrieval Config =========
+# Modello per embedding
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "textembedding-gecko@003")
+# Numero di risultati iniziali da recuperare prima del re-ranking
+INITIAL_RESULTS_COUNT = int(os.getenv("INITIAL_RESULTS_COUNT", "20"))
+# Numero di formulazioni alternative della query da generare
+QUERY_EXPANSION_COUNT = int(os.getenv("QUERY_EXPANSION_COUNT", "3"))
+# Flag per abilitare/disabilitare le tecniche avanzate
+USE_RERANKING = os.getenv("USE_RERANKING", "true").lower() == "true"
+USE_QUERY_EXPANSION = os.getenv("USE_QUERY_EXPANSION", "true").lower() == "true"
 
 if not PROJECT_ID or not ENGINE_ID or not PROJECT_NUM:
     raise RuntimeError("Missing env: PROJECT_ID, PROJECT_NUM, DISCOVERY_ENGINE_ID")
@@ -368,11 +384,11 @@ def _clean_html(text: str) -> str:
 
 def _prepare_context(search_results: List[Dict[str, Any]]) -> tuple:
     """
-    Prepara il contesto per l'LLM dai risultati di ricerca.
+    Prepara il contesto per l'LLM dai risultati di ricerca, numerando le fonti per citazioni inline.
     
     Returns:
         tuple: (context_text, sources_list)
-            - context_text: testo concatenato dei chunk
+            - context_text: testo concatenato dei chunk con riferimenti numerati
             - sources_list: lista delle fonti utilizzate
     """
     print("\n=== PREPARAZIONE CONTESTO ===")
@@ -435,20 +451,22 @@ def _prepare_context(search_results: List[Dict[str, Any]]) -> tuple:
             preview = clean_text[:100].replace('\n', ' ') + ("..." if len(clean_text) > 100 else "")
             print(f"   • Preview: {preview}")
             
-            # Aggiungi un header al chunk per identificare la fonte
+            # Aggiungi un header al chunk per identificare la fonte con numero di riferimento
+            source_number = len(sources) + 1  # Inizia la numerazione da 1
             title = result.get("title", "").strip()
             if title:
-                # Crea un header formattato per ogni chunk
-                header = f"DOCUMENTO: {title}"
+                # Crea un header formattato per ogni chunk con numero di riferimento
+                header = f"DOCUMENTO [{source_number}]: {title}"
                 clean_text = f"{header}\n\n{clean_text}"
             
             chunks.append(clean_text)
             
-            # Aggiungi la fonte
+            # Aggiungi la fonte con il numero di riferimento
             sources.append({
                 "title": result.get("title", ""),
                 "link": result.get("link", ""),
-                "score": result.get("score", 0.0)
+                "score": result.get("score", 0.0),
+                "source_number": source_number  # Aggiungi il numero di riferimento alla fonte
             })
         else:
             print(f"   • ATTENZIONE: Testo vuoto dopo la pulizia - chunk ignorato")
@@ -462,6 +480,7 @@ def _prepare_context(search_results: List[Dict[str, Any]]) -> tuple:
     print(f"   • Lunghezza contesto finale: {len(context)} caratteri")
     print(f"   • Separatore chunk: '{separator}'")
     print(f"   • Fonti incluse: {len(sources)}")
+    print(f"   • Fonti numerate per citazioni: Sì (1-{len(sources)})")
     
     if context:
         start_preview = context[:150].replace('\n', ' ')
@@ -478,7 +497,7 @@ def _prepare_context(search_results: List[Dict[str, Any]]) -> tuple:
 
 def _build_prompt(question: str, context: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     """
-    Costruisce il prompt completo per l'LLM.
+    Costruisce il prompt completo per l'LLM, con istruzioni per le citazioni inline.
     
     Args:
         question: La domanda dell'utente
@@ -488,18 +507,24 @@ def _build_prompt(question: str, context: str, history: Optional[List[Dict[str, 
     Returns:
         str: Il prompt completo
     """
-    # Sistema le istruzioni per il modello - versione migliorata
+    # Sistema le istruzioni per il modello - versione migliorata con citazioni inline
     system_prompt = """Sei un esperto consulente legale specializzato nella normativa europea e italiana. 
 Il tuo compito è rispondere in modo naturale, chiaro e professionale alle domande dell'utente.
 
-Per aiutarti, ti fornirò dei documenti che contengono informazioni pertinenti. Utilizzali come fonte per le tue risposte ma IMPORTANTE:
-- NON menzionare mai frasi come "secondo il contesto", "in base alle informazioni fornite" o simili
+Per aiutarti, ti fornirò dei documenti che contengono informazioni pertinenti, ciascuno numerato con un identificatore (es. DOCUMENTO [1], DOCUMENTO [2], ecc.). Utilizzali come fonte per le tue risposte seguendo queste LINEE GUIDA IMPORTANTI:
+
+- Cita SEMPRE la fonte utilizzando il formato [fonte: X] dopo OGNI affermazione basata sui documenti (dove X è il numero del documento)
+- Se un'informazione proviene da più documenti, cita tutte le fonti: [fonte: X, Y]
+- Quando un'affermazione è generale o di tua conoscenza e non proviene da un documento specifico, non è necessario citare
+- NON menzionare frasi come "secondo il contesto" o "in base alle informazioni fornite"
 - NON dire mai "CONTESTO" o fare riferimento diretto ai documenti forniti
 - Rispondi in modo conversazionale ed esauriente, come un esperto legale che conosce la materia
-- Integra le informazioni dai documenti in modo naturale nella tua risposta
-- Se non hai abbastanza informazioni per una risposta completa, spiega cosa sai e cosa richiederebbe ulteriori approfondimenti
-- Quando citi leggi o regolamenti, sii preciso e specifico senza sembrare che stai leggendo direttamente da un documento
+- Quando citi leggi o regolamenti, sii preciso e specifico
 - Non inventare informazioni: se una risposta richiede dati non disponibili, sii onesto riguardo ai limiti della tua conoscenza attuale
+- Integra le citazioni in modo fluido e naturale, senza interrompere il flusso della risposta
+
+ESEMPIO DI CITAZIONE:
+"Il Regolamento Generale sulla Protezione dei Dati (GDPR) è entrato in vigore il 25 maggio 2018 [fonte: 1] e prevede multe fino a 20 milioni di euro o al 4% del fatturato globale annuo [fonte: 2]."
 
 Rispondi sempre in italiano con un tono professionale ma accessibile, come un consulente che vuole essere chiaro e utile."""
     
@@ -534,7 +559,7 @@ Rispondi sempre in italiano con un tono professionale ma accessibile, come un co
     
     prompt += f"DOCUMENTI DI RIFERIMENTO:\n{context}\n\n"
     prompt += f"DOMANDA DELL'UTENTE: {question}\n\n"
-    prompt += "Fornisci una risposta professionale, conversazionale ed esauriente:"
+    prompt += "Fornisci una risposta professionale, conversazionale ed esauriente, citando sempre le fonti per ogni affermazione specifica:"
     
     print(f"5. Prompt finale: {len(prompt)} caratteri totali")
     # Stampa una preview del prompt completo
@@ -545,12 +570,13 @@ Rispondi sempre in italiano con un tono professionale ma accessibile, come un co
     return prompt
 
 
-def _generate_response(prompt: str, max_tokens: Optional[int] = None, temperature: Optional[float] = None) -> str:
+def _generate_response(prompt: str, sources: List[Dict[str, Any]] = None, max_tokens: Optional[int] = None, temperature: Optional[float] = None) -> str:
     """
     Genera una risposta utilizzando il modello Gemini.
     
     Args:
         prompt: Il prompt completo
+        sources: Lista delle fonti con numeri di riferimento per le citazioni
         max_tokens: Numero massimo di token nella risposta (opzionale)
         temperature: Temperatura per la generazione (opzionale)
         
@@ -572,6 +598,7 @@ def _generate_response(prompt: str, max_tokens: Optional[int] = None, temperatur
     print(f"   • Top-p: {GEMINI_TOP_P}")
     print(f"   • Top-k: {GEMINI_TOP_K}")
     print(f"   • Lunghezza prompt: {len(prompt)} caratteri")
+    print(f"   • Fonti disponibili per citazioni: {len(sources) if sources else 0}")
     
     try:
         print(f"\n2. Inizializzazione modello...")
@@ -603,9 +630,9 @@ def _generate_response(prompt: str, max_tokens: Optional[int] = None, temperatur
         # Estrai il testo della risposta
         answer = response.text
         
-        # Post-processing della risposta per migliorare la naturalezza
-        print(f"\n5. Esecuzione post-processing della risposta...")
-        answer = _post_process_response(answer)
+        # Post-processing della risposta per migliorare la naturalezza e formattare citazioni
+        print(f"\n5. Esecuzione post-processing della risposta con citazioni...")
+        answer = _post_process_response(answer, sources)
         
         # Log della risposta processata
         answer_preview = answer[:300] + ("..." if len(answer) > 300 else "")
@@ -628,18 +655,22 @@ def _generate_response(prompt: str, max_tokens: Optional[int] = None, temperatur
         
         return "Mi dispiace, ho riscontrato un problema nel generare una risposta. Riprova più tardi."
 
-def _post_process_response(text: str) -> str:
+def _post_process_response(text: str, sources: List[Dict[str, Any]] = None) -> str:
     """
-    Esegue il post-processing della risposta per renderla più naturale.
+    Esegue il post-processing della risposta per renderla più naturale e formattare le citazioni.
     
     Args:
         text: Il testo della risposta generata
+        sources: Lista delle fonti con numeri di riferimento
         
     Returns:
-        str: Il testo processato
+        str: Il testo processato con citazioni formattate
     """
     if not text:
         return text
+        
+    print(f"\n=== POST-PROCESSING RISPOSTA ===")
+    print(f"1. Testo originale: {len(text)} caratteri")
         
     # Lista di espressioni da sostituire per rendere la risposta più naturale
     replacements = [
@@ -671,10 +702,55 @@ def _post_process_response(text: str) -> str:
         (r"(?i)Fonti:.*$", ""),
     ]
     
-    # Applica tutte le sostituzioni
+    # Applica le sostituzioni di base per rimuovere riferimenti al contesto
     processed_text = text
     for pattern, replacement in replacements:
         processed_text = re.sub(pattern, replacement, processed_text)
+    
+    # Formattazione delle citazioni inline
+    print(f"2. Elaborazione citazioni inline...")
+    
+    # Conteggio citazioni
+    citation_pattern = r'\[fonte: (\d+(?:,\s*\d+)*)\]'
+    citations = re.findall(citation_pattern, processed_text, re.IGNORECASE)
+    citation_count = len(citations)
+    print(f"   • Citazioni trovate: {citation_count}")
+    
+    if sources and citation_count > 0:
+        print(f"   • Creazione mappa fonti per i link...")
+        # Crea mappa fonte numero -> URL
+        source_map = {}
+        for source in sources:
+            source_num = source.get('source_number')
+            source_link = source.get('link', '')
+            source_title = source.get('title', '')
+            if source_num and (source_link or source_title):
+                source_map[str(source_num)] = {'link': source_link, 'title': source_title}
+        
+        # Funzione per sostituire le citazioni con link formattati
+        def format_citation(match):
+            citation_text = match.group(0)  # Il testo originale [fonte: X]
+            source_nums = match.group(1)    # I numeri delle fonti "1" o "1, 2, 3"
+            
+            # Separa i numeri di fonte
+            nums = [num.strip() for num in source_nums.split(',')]
+            
+            formatted_citations = []
+            for num in nums:
+                source_info = source_map.get(num)
+                if source_info and source_info.get('link'):
+                    formatted_citations.append(f"<a href=\"{source_info['link']}\" target=\"_blank\" title=\"{source_info.get('title', '')}\">[{num}]</a>")
+                else:
+                    formatted_citations.append(f"[{num}]")
+                    
+            # Unisci le citazioni formattate
+            return " ".join(formatted_citations)
+        
+        # Applica la formattazione delle citazioni
+        processed_text = re.sub(citation_pattern, format_citation, processed_text, flags=re.IGNORECASE)
+        print(f"   • Citazioni formattate con link cliccabili")
+    else:
+        print(f"   • Nessuna formattazione applicata (fonti mancanti o nessuna citazione)")
     
     # Rimuovi righe vuote multiple
     processed_text = re.sub(r'\n\s*\n\s*\n+', '\n\n', processed_text)
@@ -689,48 +765,295 @@ def _post_process_response(text: str) -> str:
     if processed_text and processed_text[0].islower():
         processed_text = processed_text[0].upper() + processed_text[1:]
     
-    print(f"Post-processing completato: {len(text)} -> {len(processed_text)} caratteri")
+    print(f"3. Post-processing completato: {len(text)} -> {len(processed_text)} caratteri")
+    print(f"=== FINE POST-PROCESSING ===\n")
+    
     return processed_text
-def _get_document_text(doc_id: str) -> Dict[str, Any]:
-    """Legge il documento direttamente dal Data Store (richiede Serve content attivo)."""
-    if not DATA_STORE_ID:
-        raise HTTPException(status_code=400, detail="DATA_STORE_ID mancante")
-    name = f"{DOC_PARENT}/documents/{doc_id}"
+
+# ========= Advanced Retrieval Functions =========
+
+def _generate_query_expansions(query: str, num_variations: int = 3) -> List[str]:
+    """
+    Genera variazioni della query originale utilizzando Gemini per catturare aspetti diversi.
+    
+    Args:
+        query: La query originale dell'utente
+        num_variations: Numero di variazioni da generare
+        
+    Returns:
+        List[str]: Lista di formulazioni alternative della query
+    """
+    print("\n=== GENERAZIONE ESPANSIONI QUERY ===")
+    print(f"• Query originale: '{query}'")
+    print(f"• Richieste variazioni: {num_variations}")
+    
     try:
-        doc = doc_client.get_document(name=name)
-    except NotFound:
-        raise HTTPException(status_code=404, detail="Documento non trovato")
+        # Crea prompt per generare variazioni della query
+        prompt = f"""Sei uno specialista in information retrieval per sistemi RAG (Retrieval Augmented Generation). 
+La tua attività è quella di riformulare una singola query in {num_variations} variazioni alternative 
+che catturino significati e aspetti diversi della ricerca originale.
 
-    body = {"id": getattr(doc, "id", doc_id), "title": "", "link": "", "text": ""}
+Regole:
+1. Crea ESATTAMENTE {num_variations} variazioni, numerandole da 1 a {num_variations}
+2. Mantieni lo stesso intento della query originale
+3. Usa sinonimi, forme di espressione alternative e concetti correlati
+4. Formula le variazioni in modo che coprano aspetti diversi del tema
+5. Ogni variazione dovrebbe essere BREVE e CONCISA (massimo 20 parole)
+6. Rispondi SOLO con le {num_variations} variazioni, numerate 1-{num_variations}, senza altro testo
+7. Mantieni la lingua originale della query
 
+Query originale: "{query}"
+
+Le {num_variations} variazioni della query sono:"""
+        
+        # Configura parametri e modello
+        generation_config = {
+            "max_output_tokens": 1024,
+            "temperature": 0.7,  # Temperatura più alta per maggiore creatività
+            "top_p": 0.95,
+            "top_k": 40
+        }
+        
+        model = GenerativeModel(
+            model_name=GEMINI_MODEL,
+            generation_config=generation_config
+        )
+        
+        print(f"• Invio prompt a Gemini per generazione variazioni...")
+        response = model.generate_content(prompt)
+        
+        # Estrai e pulisci il testo delle variazioni
+        expansions_text = response.text.strip()
+        print(f"• Risposta ricevuta: {len(expansions_text)} caratteri")
+        
+        # Estrai le variazioni numerate con espressione regolare
+        expansion_pattern = r'(?:^|\n)\s*(\d+)\s*[.:)]\s*(.*?)(?=\n\s*\d+\s*[.:)]|$)'
+        matches = re.findall(expansion_pattern, expansions_text, re.DOTALL)
+        
+        # Pulisci e raccogli le espansioni
+        expansions = [query.strip()]  # Includi sempre la query originale
+        for _, expansion_text in matches:
+            clean_expansion = expansion_text.strip()
+            if clean_expansion and clean_expansion != query.strip():
+                expansions.append(clean_expansion)
+        
+        # Se non abbiamo abbastanza espansioni, usa solo quelle disponibili
+        if len(expansions) <= 1:
+            print(f"• ATTENZIONE: Nessuna espansione generata, uso solo la query originale")
+            return [query]
+            
+        print(f"• Espansioni generate: {len(expansions)-1}")
+        for i, exp in enumerate(expansions):
+            label = "Originale" if i == 0 else f"Variante {i}"
+            print(f"  {label}: '{exp}'")
+            
+        print("=== FINE GENERAZIONE ESPANSIONI ===\n")
+        return expansions
+        
+    except Exception as e:
+        print(f"• ERRORE nella generazione delle espansioni: {str(e)}")
+        print("• Utilizzo solo la query originale")
+        print("=== FINE GENERAZIONE ESPANSIONI (CON ERRORE) ===\n")
+        return [query]
+
+# Inizializza il modello di embedding una sola volta
+_embedding_model = None
+
+def _get_embedding_model():
+    """Ritorna il modello di embedding, inizializzandolo se necessario."""
+    global _embedding_model
+    if _embedding_model is None:
+        try:
+            _embedding_model = TextEmbeddingModel.from_pretrained(EMBEDDING_MODEL)
+            print(f"Modello di embedding {EMBEDDING_MODEL} inizializzato")
+        except Exception as e:
+            print(f"ERRORE nell'inizializzazione del modello di embedding: {str(e)}")
+            return None
+    return _embedding_model
+
+@lru_cache(maxsize=100)
+def _get_text_embedding(text: str):
+    """
+    Ottiene l'embedding di un testo con cache per evitare calcoli ripetuti.
+    
+    Args:
+        text: Il testo di cui generare l'embedding
+        
+    Returns:
+        numpy.ndarray: L'embedding del testo o None in caso di errore
+    """
+    model = _get_embedding_model()
+    if not model:
+        return None
+        
     try:
-        derived = MessageToDict(getattr(doc, "derived_struct_data", {}))
-        structd = MessageToDict(getattr(doc, "struct_data", {}))
-    except Exception:
-        derived, structd = {}, {}
+        embeddings = model.get_embeddings([text])
+        if embeddings and embeddings[0].values:
+            return np.array(embeddings[0].values)
+        return None
+    except Exception as e:
+        print(f"ERRORE nel calcolo dell'embedding: {str(e)}")
+        return None
 
-    body["title"] = derived.get("title") or structd.get("title") or body["id"]
-    body["link"] = derived.get("link") or structd.get("link") or ""
+def _rerank_results(query: str, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Riordina i risultati usando la similarità semantica tramite coseno.
+    
+    Args:
+        query: La query dell'utente
+        results: Lista dei risultati da riordinare
+        
+    Returns:
+        List[Dict[str, Any]]: Risultati riordinati per similarità semantica
+    """
+    print("\n=== RERANKING DEI RISULTATI ===")
+    print(f"• Risultati da riordinare: {len(results)}")
+    
+    if not results:
+        print("• ERRORE: Nessun risultato da riordinare")
+        print("=== FINE RERANKING ===\n")
+        return []
+    
+    # Ottieni l'embedding della query
+    query_embedding = _get_text_embedding(query)
+    if query_embedding is None:
+        print("• ERRORE: Impossibile calcolare l'embedding della query")
+        print("• Uso l'ordinamento originale basato sugli score")
+        print("=== FINE RERANKING (CON ERRORE) ===\n")
+        return results
+    
+    # Lista per memorizzare gli score di similarità calcolati
+    similarities = []
+    
+    # Calcola la similarità per ciascun risultato
+    for i, result in enumerate(results):
+        # Prepara il testo da utilizzare per l'embedding
+        title = result.get("title", "").strip()
+        text = result.get("text", "").strip()
+        content = f"{title} {text}".strip() if title else text
+        
+        if not content:
+            print(f"  Risultato {i+1}: SALTATO (nessun testo)")
+            similarities.append((i, -1.0))  # Score minimo per risultati senza testo
+            continue
+            
+        # Calcola l'embedding e la similarità
+        result_embedding = _get_text_embedding(content[:1000])  # Limita la lunghezza
+        
+        if result_embedding is None:
+            print(f"  Risultato {i+1}: ERRORE calcolo embedding")
+            similarities.append((i, -1.0))
+            continue
+            
+        # Calcola la similarità del coseno
+        similarity = cosine_similarity([query_embedding], [result_embedding])[0][0]
+        
+        # Combina lo score originale con la similarità semantica
+        original_score = result.get("score", 0.0)
+        combined_score = 0.7 * similarity + 0.3 * original_score
+        
+        similarities.append((i, combined_score))
+        
+        print(f"  Risultato {i+1}: Sim={similarity:.4f}, Score={original_score:.4f}, Combinato={combined_score:.4f}")
+    
+    # Ordina i risultati per score combinato decrescente
+    similarities.sort(key=lambda x: x[1], reverse=True)
+    
+    # Crea la nuova lista di risultati riordinati
+    reranked_results = []
+    for idx, score in similarities:
+        if score >= 0:  # Escludi i risultati con score negativo (errori)
+            result = results[idx].copy()
+            result["semantic_score"] = score
+            reranked_results.append(result)
+    
+    print(f"• Risultati dopo reranking: {len(reranked_results)}")
+    print("=== FINE RERANKING ===\n")
+    
+    return reranked_results
 
-    try:
-        cont = MessageToDict(getattr(doc, "content", {}))
-        if isinstance(cont, dict):
-            raw = cont.get("rawText") or cont.get("content") or ""
-            if isinstance(raw, str):
-                body["text"] = raw[:1200]
-    except Exception:
-        pass
-
-    if not body["text"]:
-        sn = derived.get("snippets") or structd.get("snippets") or []
-        if isinstance(sn, list) and sn:
-            x = sn[0]
-            if isinstance(x, str):
-                body["text"] = x[:1200]
-            elif isinstance(x, dict) and "snippet" in x:
-                body["text"] = x["snippet"][:1200]
-
-    return body
+def _search_with_advanced_retrieval(query: str, page_size: int = 5, mode: str = "CHUNKS") -> List[Dict[str, Any]]:
+    """
+    Esegue una ricerca avanzata con espansione delle query e riordinamento semantico.
+    
+    Args:
+        query: La query dell'utente
+        page_size: Numero di risultati da restituire
+        mode: Modalità di ricerca ("CHUNKS" o "DOCUMENTS")
+        
+    Returns:
+        List[Dict[str, Any]]: Risultati della ricerca
+    """
+    print("\n=== RICERCA AVANZATA ===")
+    print(f"• Query: '{query}'")
+    print(f"• Modalità: {mode}")
+    print(f"• Page size finale: {page_size}")
+    
+    results_by_query = {}
+    all_results = []
+    
+    # 1. Se abilitata, genera espansioni della query
+    queries = [query]
+    if USE_QUERY_EXPANSION:
+        queries = _generate_query_expansions(query, QUERY_EXPANSION_COUNT)
+    
+    # 2. Per ogni query (originale e espansioni), esegui la ricerca base
+    for i, q in enumerate(queries):
+        query_label = "Originale" if i == 0 else f"Espansione {i}"
+        print(f"\n• Esecuzione ricerca per query {i+1}/{len(queries)} ({query_label}): '{q}'")
+        
+        # Usa la size maggiorata per poi fare reranking
+        search_size = INITIAL_RESULTS_COUNT if USE_RERANKING else page_size
+        
+        try:
+            # Esegui la ricerca standard con la query
+            results = _search(q, search_size, mode)
+            results_count = len(results)
+            
+            print(f"  - Risultati trovati: {results_count}")
+            results_by_query[q] = results
+            
+            # Aggiungi i risultati alla lista globale
+            for result in results:
+                # Aggiungi solo se non è già presente (evita duplicati)
+                result_id = result.get("id", "")
+                if not any(r.get("id", "") == result_id for r in all_results):
+                    all_results.append(result)
+                
+        except Exception as e:
+            print(f"  - ERRORE nella ricerca: {str(e)}")
+    
+    # Stampa riepilogo risultati per ogni query
+    print(f"\n• Riepilogo risultati per query:")
+    for i, q in enumerate(queries):
+        query_label = "Originale" if i == 0 else f"Espansione {i}"
+        results_count = len(results_by_query.get(q, []))
+        print(f"  - {query_label}: {results_count} risultati")
+    
+    print(f"• Totale risultati unici: {len(all_results)}")
+    
+    # 3. Se abilitato, applica il reranking
+    if USE_RERANKING and all_results:
+        print(f"\n• Applicazione reranking semantico...")
+        all_results = _rerank_results(query, all_results)
+    
+    # 4. Limita il numero di risultati
+    if len(all_results) > page_size:
+        all_results = all_results[:page_size]
+        print(f"• Limitazione a {page_size} risultati finali")
+    
+    print(f"• Risultati finali: {len(all_results)}")
+    
+    # 5. Stampa log dei risultati finali
+    print("\n• RISULTATI FINALI:")
+    for i, result in enumerate(all_results):
+        print(f"  [{i+1}] Score: {result.get('score', 0):.4f} | Titolo: {result.get('title', 'N/A')[:60]}")
+        semantic_score = result.get('semantic_score')
+        if semantic_score is not None:
+            print(f"      Semantic score: {semantic_score:.4f}")
+    
+    print("=== FINE RICERCA AVANZATA ===\n")
+    return all_results
 
 def _search(query: str, page_size: int, mode: str) -> List[Dict[str, Any]]:
     print("\n=== RICERCA DISCOVERY ENGINE ===")
@@ -839,12 +1162,118 @@ def _search(query: str, page_size: int, mode: str) -> List[Dict[str, Any]]:
     
     return packed
 
+def _get_document_text(doc_id: str) -> Dict[str, Any]:
+    """Legge il documento direttamente dal Data Store (richiede Serve content attivo)."""
+    if not DATA_STORE_ID:
+        raise HTTPException(status_code=400, detail="DATA_STORE_ID mancante")
+    name = f"{DOC_PARENT}/documents/{doc_id}"
+    try:
+        doc = doc_client.get_document(name=name)
+    except NotFound:
+        raise HTTPException(status_code=404, detail="Documento non trovato")
+
+    body = {"id": getattr(doc, "id", doc_id), "title": "", "link": "", "text": ""}
+
+    try:
+        derived = MessageToDict(getattr(doc, "derived_struct_data", {}))
+        structd = MessageToDict(getattr(doc, "struct_data", {}))
+    except Exception:
+        derived, structd = {}, {}
+
+    body["title"] = derived.get("title") or structd.get("title") or body["id"]
+    body["link"] = derived.get("link") or structd.get("link") or ""
+
+    try:
+        cont = MessageToDict(getattr(doc, "content", {}))
+        if isinstance(cont, dict):
+            raw = cont.get("rawText") or cont.get("content") or ""
+            if isinstance(raw, str):
+                body["text"] = raw[:1200]
+    except Exception:
+        pass
+
+    if not body["text"]:
+        sn = derived.get("snippets") or structd.get("snippets") or []
+        if isinstance(sn, list) and sn:
+            x = sn[0]
+            if isinstance(x, str):
+                body["text"] = x[:1200]
+            elif isinstance(x, dict) and "snippet" in x:
+                body["text"] = x["snippet"][:1200]
+
+    return body
+
+def _process_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Processa le fonti per rimuovere duplicati e ordinarle per rilevanza.
+    
+    Args:
+        sources: Lista delle fonti con title, link e score
+    
+    Returns:
+        List[Dict[str, Any]]: Lista filtrata e ordinata delle fonti
+    """
+    if not sources:
+        return []
+    
+    # Dizionario per tenere traccia delle fonti uniche (per link)
+    unique_sources = {}
+    
+    # Aggrega le fonti con lo stesso link e tieni il punteggio più alto
+    for source in sources:
+        link = source.get("link", "")
+        title = source.get("title", "")
+        score = source.get("score", 0.0)
+        
+        # Salta fonti senza link
+        if not link:
+            continue
+        
+        # Se il link è già presente, aggiorna solo se il punteggio è più alto
+        if link in unique_sources:
+            if score > unique_sources[link]["score"]:
+                unique_sources[link] = {
+                    "title": title or unique_sources[link]["title"],
+                    "link": link,
+                    "score": score
+                }
+        else:
+            unique_sources[link] = {
+                "title": title or link,
+                "link": link, 
+                "score": score
+            }
+    
+    # Converti il dizionario in lista
+    result = list(unique_sources.values())
+    
+    # Ordina per score decrescente
+    result.sort(key=lambda x: x.get("score", 0), reverse=True)
+    
+    # Limita il numero di fonti (opzionale)
+    max_sources = 5
+    if len(result) > max_sources:
+        result = result[:max_sources]
+    
+    return result
+
+@app.get("/", response_class=FileResponse)
+def index():
+    """Serve il file HTML statico dalla cartella static."""
+    return FileResponse("static/index.html")
+
 # ========= Routes =========
 @app.post("/search")
 def search_post(body: SearchIn):
     try:
-        packed = _search(body.query, body.page_size, body.mode)
-        # fallback ‘getdoc’ di 3 doc se packed vuoto o senza testo
+        # Se sono abilitate le tecniche avanzate, usa la funzione avanzata
+        if USE_RERANKING or USE_QUERY_EXPANSION:
+            packed = _search_with_advanced_retrieval(body.query, body.page_size, body.mode)
+        else:
+            # Altrimenti, usa la ricerca standard
+            packed = _search(body.query, body.page_size, body.mode)
+            
+        # fallback 'getdoc' di 3 doc se packed vuoto o senza testo
         if DATA_STORE_ID and (not packed or all(not (x.get("text") or "").strip() for x in packed)):
             # usa una query corta per identificare id doc
             rest = _search_rest(re.sub(r"\s+", " ", body.query)[:200], 3, "DOCUMENTS")
@@ -867,7 +1296,13 @@ def search_post(body: SearchIn):
 @app.get("/search")
 def search_get(q: str, page_size: int = 3, mode: str = "CHUNKS"):
     try:
-        packed = _search(q, page_size, mode)
+        # Se sono abilitate le tecniche avanzate, usa la funzione avanzata
+        if USE_RERANKING or USE_QUERY_EXPANSION:
+            packed = _search_with_advanced_retrieval(q, page_size, mode)
+        else:
+            # Altrimenti, usa la ricerca standard
+            packed = _search(q, page_size, mode)
+            
         if DATA_STORE_ID and (not packed or all(not (x.get("text") or "").strip() for x in packed)):
             rest = _search_rest(re.sub(r"\s+"," ",q)[:200], 3, "DOCUMENTS")
             ids = [((i.get("document") or {}).get("id") or "") for i in rest.get("results", [])]
@@ -983,18 +1418,29 @@ async def chat_endpoint(body: ChatIn):
             for i, msg in enumerate(body.history):
                 print(f"  - Messaggio {i+1}: {msg.get('role', 'unknown')} ({len(msg.get('content', ''))} caratteri)")
         
-        # 1. Fase di Retrieval: Utilizza la funzione esistente di ricerca
+        # 1. Fase di Retrieval: Utilizza la funzione di ricerca avanzata o standard
         print(f"\n=== FASE 1: RETRIEVAL (CHUNKS) ===")
         retrieval_start = time.time()
         
-        search_results = _search(body.question, RAG_MAX_CHUNKS, "CHUNKS")
+        # Utilizza la ricerca avanzata se abilitata
+        if USE_RERANKING or USE_QUERY_EXPANSION:
+            search_results = _search_with_advanced_retrieval(
+                body.question, 
+                RAG_MAX_CHUNKS, 
+                "CHUNKS"
+            )
+            retrieval_method = "ricerca_avanzata"
+        else:
+            search_results = _search(body.question, RAG_MAX_CHUNKS, "CHUNKS")
+            retrieval_method = "ricerca_standard"
         
         retrieval_time = time.time() - retrieval_start
-        print(f"Tempo di retrieval: {retrieval_time:.2f} secondi")
+        print(f"Tempo di retrieval ({retrieval_method}): {retrieval_time:.2f} secondi")
         
         # Aggiungi al log
         rag_debug["steps"].append({
             "step": "retrieval_chunks",
+            "method": retrieval_method,
             "time": retrieval_time,
             "results_count": len(search_results),
             "results": [{"id": r.get("id", ""), "title": r.get("title", ""), "score": r.get("score", 0)} for r in search_results]
@@ -1018,14 +1464,25 @@ async def chat_endpoint(body: ChatIn):
             print(f"\n=== FASE 1b: RETRY RETRIEVAL (DOCUMENTS) ===")
             retry_start = time.time()
             
-            search_results = _search(body.question, RAG_MAX_CHUNKS, "DOCUMENTS")
+            # Utilizza la ricerca avanzata se abilitata
+            if USE_RERANKING or USE_QUERY_EXPANSION:
+                search_results = _search_with_advanced_retrieval(
+                    body.question, 
+                    RAG_MAX_CHUNKS, 
+                    "DOCUMENTS"
+                )
+                retry_method = "ricerca_avanzata"
+            else:
+                search_results = _search(body.question, RAG_MAX_CHUNKS, "DOCUMENTS")
+                retry_method = "ricerca_standard"
             
             retry_time = time.time() - retry_start
-            print(f"Tempo di retrieval (DOCUMENTS): {retry_time:.2f} secondi")
+            print(f"Tempo di retrieval (DOCUMENTS, {retry_method}): {retry_time:.2f} secondi")
             
             # Aggiungi al log
             rag_debug["steps"].append({
                 "step": "retrieval_documents",
+                "method": retry_method,
                 "time": retry_time,
                 "results_count": len(search_results),
                 "results": [{"id": r.get("id", ""), "title": r.get("title", ""), "score": r.get("score", 0)} for r in search_results]
@@ -1100,7 +1557,8 @@ async def chat_endpoint(body: ChatIn):
         generation_start = time.time()
         
         answer = _generate_response(
-            prompt, 
+            prompt,
+            sources=sources,
             max_tokens=body.max_tokens, 
             temperature=body.temperature
         )
@@ -1169,65 +1627,6 @@ async def chat_endpoint(body: ChatIn):
         print(traceback.format_exc())
         print("==================================================\n")
         raise HTTPException(status_code=502, detail=f"Errore durante l'elaborazione: {str(e)}")
-
-def _process_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Processa le fonti per rimuovere duplicati e ordinarle per rilevanza.
-    
-    Args:
-        sources: Lista delle fonti con title, link e score
-    
-    Returns:
-        List[Dict[str, Any]]: Lista filtrata e ordinata delle fonti
-    """
-    if not sources:
-        return []
-    
-    # Dizionario per tenere traccia delle fonti uniche (per link)
-    unique_sources = {}
-    
-    # Aggrega le fonti con lo stesso link e tieni il punteggio più alto
-    for source in sources:
-        link = source.get("link", "")
-        title = source.get("title", "")
-        score = source.get("score", 0.0)
-        
-        # Salta fonti senza link
-        if not link:
-            continue
-        
-        # Se il link è già presente, aggiorna solo se il punteggio è più alto
-        if link in unique_sources:
-            if score > unique_sources[link]["score"]:
-                unique_sources[link] = {
-                    "title": title or unique_sources[link]["title"],
-                    "link": link,
-                    "score": score
-                }
-        else:
-            unique_sources[link] = {
-                "title": title or link,
-                "link": link, 
-                "score": score
-            }
-    
-    # Converti il dizionario in lista
-    result = list(unique_sources.values())
-    
-    # Ordina per score decrescente
-    result.sort(key=lambda x: x.get("score", 0), reverse=True)
-    
-    # Limita il numero di fonti (opzionale)
-    max_sources = 5
-    if len(result) > max_sources:
-        result = result[:max_sources]
-    
-    return result
-
-@app.get("/", response_class=FileResponse)
-def index():
-    """Serve il file HTML statico dalla cartella static."""
-    return FileResponse("static/index.html")
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), workers=1)
