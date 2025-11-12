@@ -1,0 +1,17 @@
+# .gcloudignore file per escludere file durante i deployment
+.git
+.gitignore
+.github
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+ENV/
+*.md
+!README.md
+*.log
+*.tmp
+.DS_Store

@@ -1,0 +1,39 @@
+steps:
+  # Costruisci l'immagine Docker
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/legal-rag-api:$COMMIT_SHA', '.']
+  
+  # Push dell'immagine su Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/legal-rag-api:$COMMIT_SHA']
+  
+  # Deploy su Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'legal-rag-api'
+      - '--image=gcr.io/$PROJECT_ID/legal-rag-api:$COMMIT_SHA'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--memory=512Mi'
+      - '--cpu=1'
+      - '--set-env-vars=PROJECT_ID=$PROJECT_ID,DISCOVERY_LOCATION=${_DISCOVERY_LOCATION},DISCOVERY_ENGINE_ID=${_DISCOVERY_ENGINE_ID},DISCOVERY_COLLECTION=${_DISCOVERY_COLLECTION},DATA_STORE_ID=${_DATA_STORE_ID},GEMINI_MODEL=${_GEMINI_MODEL},GEMINI_LOCATION=${_GEMINI_LOCATION}'
+
+# Immagini da salvare in Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/legal-rag-api:$COMMIT_SHA'
+
+substitutions:
+  _REGION: 'europe-west1'
+  _DISCOVERY_LOCATION: 'eu'
+  _DISCOVERY_ENGINE_ID: ''
+  _DISCOVERY_COLLECTION: 'default_collection'
+  _DATA_STORE_ID: ''
+  _GEMINI_MODEL: 'gemini-2.5-pro'
+  _GEMINI_LOCATION: 'europe-west4'
+
+# Timeout più lungo per permettere build completa
+timeout: '1200s'

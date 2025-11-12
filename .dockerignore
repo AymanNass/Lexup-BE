@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+.github
+
+# Ambiente virtuale e cache Python
+__pycache__
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Docker e CI/CD
+Dockerfile*
+cloudbuild.yaml
+
+# Altri file
+*.md
+*.log
+*.tmp
+.DS_Store
