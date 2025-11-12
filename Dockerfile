@@ -20,4 +20,4 @@ EXPOSE 8080
 
 # Comando per avviare FastAPI con Uvicorn USANDO la variabile $PORT
 # Cloud Run sostituirà ${PORT} con il valore corretto (es. 8080)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "${PORT}"]
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT}
